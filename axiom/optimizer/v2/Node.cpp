@@ -386,14 +386,13 @@ ExprCP survivingEquiKey(ExprCP key, const PlanObjectSet& outputColumns) {
   return nullptr;
 }
 
-// Output global partitioning of a join. A join keeps the probe's (left's)
-// partitioning when every output row is a probe row carrying its probe column
-// values unchanged, which holds for inner, left, the left semi and anti
-// joins, and the counting semijoin. Right and full joins emit build rows, so
-// they drop it.
+// Output global partitioning of a join. A one-sided join keeps the partitioning
+// of its preserved input: the left input for left, left-semi, anti, and
+// counting-semi joins; the right input for right and right-semi joins. An inner
+// join uses the left input. A full join has no one-sided partitioning.
 //
-// If every probe key is still an output column, the output is partitioned
-// exactly as the probe was. Otherwise only an inner join recovers a dropped
+// If every retained key is still an output column, the output is partitioned
+// exactly as that input was. Otherwise only an inner join recovers a dropped
 // key: it keeps a key whose columns all survive (a join projects columns
 // unchanged, so a surviving column is identity-projected, and an expression
 // over surviving columns still partitions the output), else substitutes an
@@ -408,6 +407,8 @@ Partitioning joinGlobalPartition(
     NodeCP left,
     NodeCP right,
     const ColumnVector& outputColumns) {
+  NodeCP retainedInput;
+  NodeCP otherInput;
   switch (joinType) {
     case velox::core::JoinType::kInner:
     case velox::core::JoinType::kLeft:
@@ -415,34 +416,42 @@ Partitioning joinGlobalPartition(
     case velox::core::JoinType::kLeftSemiProject:
     case velox::core::JoinType::kAnti:
     case velox::core::JoinType::kCountingLeftSemiFilter:
+      retainedInput = left;
+      otherInput = right;
+      break;
+    case velox::core::JoinType::kRight:
+    case velox::core::JoinType::kRightSemiFilter:
+    case velox::core::JoinType::kRightSemiProject:
+      retainedInput = right;
+      otherInput = left;
       break;
     default:
       return {};
   }
 
-  Partitioning probe = left->physicalProperties().globalPartition;
-  if (probe.kind != PartitionKind::kPartitioned) {
-    return probe.dropOrder();
+  Partitioning retained = retainedInput->physicalProperties().globalPartition;
+  if (retained.kind != PartitionKind::kPartitioned) {
+    return retained.dropOrder();
   }
 
   // Both sides connector-bucketed: the join runs on the partitioning the two
-  // agree on, which can be coarser than the probe's. Reporting the probe's
-  // would let a consumer align a shuffle to more partitions than the join's
-  // fragment has tasks.
-  const auto* buildType =
-      right->physicalProperties().globalPartition.partitionType;
-  if (probe.partitionType != nullptr && buildType != nullptr) {
+  // agree on, which can be coarser than the retained input's. Reporting the
+  // original partitioning would let a consumer align a shuffle to more
+  // partitions than the join's fragment has tasks.
+  const auto* otherType =
+      otherInput->physicalProperties().globalPartition.partitionType;
+  if (retained.partitionType != nullptr && otherType != nullptr) {
     const auto* folded =
-        queryCtx()->copartitionedType(probe.partitionType, buildType);
+        queryCtx()->copartitionedType(retained.partitionType, otherType);
     if (folded == nullptr) {
       return {};
     }
-    probe.partitionType = folded;
+    retained.partitionType = folded;
   }
 
   const auto outputSet = PlanObjectSet::fromObjects(outputColumns);
-  if (outputSet.containsAll(probe.keys)) {
-    return probe;
+  if (outputSet.containsAll(retained.keys)) {
+    return retained;
   }
 
   if (joinType != velox::core::JoinType::kInner) {
@@ -450,8 +459,8 @@ Partitioning joinGlobalPartition(
   }
 
   ExprVector keys;
-  keys.reserve(probe.keys.size());
-  for (ExprCP key : probe.keys) {
+  keys.reserve(retained.keys.size());
+  for (ExprCP key : retained.keys) {
     if (outputSet.containsColumns(key)) {
       keys.push_back(key);
       continue;
@@ -463,7 +472,7 @@ Partitioning joinGlobalPartition(
     keys.push_back(equiKey);
   }
 
-  Partitioning result = probe;
+  Partitioning result = retained;
   result.keys = std::move(keys);
   return result;
 }

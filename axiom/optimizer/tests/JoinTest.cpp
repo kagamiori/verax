@@ -47,6 +47,15 @@ class JoinTest : public test::QueryTestBase,
         ->setStats(numRows, stats);
   }
 
+  void addBucketedJoinTables() {
+    testConnector_->addTable(
+        "t", ROW("a", BIGINT()), ROW({}), connector::TestBucketSpec{{"a"}, 2});
+    testConnector_->addTable(
+        "u", ROW("b", BIGINT()), ROW({}), connector::TestBucketSpec{{"b"}, 2});
+    testConnector_->addTable(
+        "v", ROW("c", BIGINT()), ROW({}), connector::TestBucketSpec{{"c"}, 2});
+  }
+
   using test::QueryTestBase::toSingleNodePlan;
 
   velox::core::PlanNodePtr toSingleNodePlan(std::string_view sql) {
@@ -469,6 +478,77 @@ TEST_P(JoinTest, nestedOuterJoins) {
                      .build();
 
   AXIOM_ASSERT_PLAN(plan, matcher);
+}
+
+TEST_P(JoinTest, rightJoinPreservesBuildPartitioning) {
+  addBucketedJoinTables();
+
+  const auto logicalPlan = parseSelect(
+      "SELECT u.b "
+      "FROM t RIGHT JOIN u ON t.a = u.b "
+      "JOIN v ON u.b = v.c",
+      kTestConnectorId);
+  const auto distributedPlan = planVelox(logicalPlan, {.numWorkers = 2});
+
+  auto matcher =
+      matchScan("t")
+          .hashJoin(matchScan("u"), core::JoinType::kRight)
+          .hashJoinInner(matchScan("v"), {.keys = {{"b = c"}}})
+          .fragment({.width = 2, .bucketedScans = 3, .bucketedExchanges = 0})
+          .gather()
+          .build();
+  AXIOM_ASSERT_DISTRIBUTED_PLAN_V2(distributedPlan.plan, matcher);
+}
+
+TEST_P(JoinTest, rightSemiFilterPreservesBuildPartitioning) {
+  addBucketedJoinTables();
+  testConnector_->setStats("t", 1'000'000, {{"a", {.numDistinct = 1'000'000}}});
+  testConnector_->setStats("u", 1'000, {{"b", {.numDistinct = 1'000}}});
+
+  const auto logicalPlan = parseSelect(
+      "SELECT s.b "
+      "FROM (SELECT u.b FROM u WHERE u.b IN (SELECT a FROM t)) s "
+      "JOIN v ON s.b = v.c",
+      kTestConnectorId);
+  const auto distributedPlan = planVelox(logicalPlan, {.numWorkers = 2});
+
+  auto matcher =
+      matchScan("t")
+          .hashJoin(matchScan("u"), core::JoinType::kRightSemiFilter)
+          .hashJoinInner(matchScan("v"), {.keys = {{"b = c"}}})
+          .fragment({.width = 2, .bucketedScans = 3, .bucketedExchanges = 0})
+          .gather()
+          .build();
+  AXIOM_ASSERT_DISTRIBUTED_PLAN_V2(distributedPlan.plan, matcher);
+}
+
+TEST_P(JoinTest, rightSemiProjectPreservesBuildPartitioning) {
+  addBucketedJoinTables();
+  testConnector_->setStats("t", 1'000'000, {{"a", {.numDistinct = 1'000'000}}});
+  testConnector_->setStats("u", 1'000, {{"b", {.numDistinct = 1'000}}});
+
+  const auto logicalPlan = parseSelect(
+      "SELECT s.b, s.matched "
+      "FROM ("
+      "  SELECT u.b, EXISTS (SELECT 1 FROM t WHERE t.a = u.b) AS matched "
+      "  FROM u"
+      ") s "
+      "JOIN v ON s.b = v.c",
+      kTestConnectorId);
+  const auto distributedPlan = planVelox(logicalPlan, {.numWorkers = 2});
+
+  auto matcher =
+      matchScan("t")
+          .hashJoin(
+              matchScan("u"),
+              core::JoinType::kRightSemiProject,
+              {.nullAware = false})
+          .hashJoinInner(matchScan("v"), {.keys = {{"b = c"}}})
+          .project()
+          .fragment({.width = 2, .bucketedScans = 3, .bucketedExchanges = 0})
+          .gather()
+          .build();
+  AXIOM_ASSERT_DISTRIBUTED_PLAN_V2(distributedPlan.plan, matcher);
 }
 
 TEST_P(JoinTest, joinWithComputedKeys) {
